@@ -1,4 +1,4 @@
-# resolvepatch
+# resolvepatch v2
 
 Patch Davinci Resolve Studio 18.x-20.x to think it's activated
 
