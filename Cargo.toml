@@ -1,0 +1,10 @@
+[package]
+name = "resolvepatch"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+simplelog = "0.12"
+thiserror = "2"
+windows-registry = "0.4"
