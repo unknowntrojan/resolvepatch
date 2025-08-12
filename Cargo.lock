@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+<<<<<<< HEAD
+=======
+name = "coolfindpattern"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "003d8e0e5c0c28bce63bf33081e01410e66281b44eafcaf2a2769339876b6390"
+
+[[package]]
+>>>>>>> upstream/master
 name = "deranged"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -72,6 +81,10 @@ dependencies = [
 name = "resolvepatch"
 version = "0.1.0"
 dependencies = [
+<<<<<<< HEAD
+=======
+ "coolfindpattern",
+>>>>>>> upstream/master
  "log",
  "simplelog",
  "thiserror",
