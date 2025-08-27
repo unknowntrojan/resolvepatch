@@ -1,0 +1,9 @@
+[package]
+name = "coolfindpattern"
+version = "0.1.6"
+edition = "2021"
+description = "Fixed version of coolfindpattern without array_chunks"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
