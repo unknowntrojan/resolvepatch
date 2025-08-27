@@ -1,6 +1,8 @@
 use coolfindpattern::pattern;
-use simplelog::Config;
-use windows_registry::CURRENT_USER;
+use simplelog::{Config, SimpleLogger};
+use windows_registry::{CURRENT_USER, LOCAL_MACHINE};
+use std::{fs, path::Path, thread, time::Duration};
+use log::{warn, info, error};
 
 const PATCHES: &'static [(&'static [Option<u8>], &'static [u8])] = &[
     (
@@ -28,82 +30,187 @@ enum PatchError {
     SignatureOccurrenceMismatch(usize),
     #[error("This version of Resolve is either not compatible or was already patched.")]
     NoSignatureFound,
-    #[error("Unable to backup Resolve.exe.")]
+    #[error("Unable to backup Resolve.")]
     BackupFailed,
-    #[error("Unable to write patched Resolve.exe back.")]
+    #[error("Unable to write patched Resolve back.")]
     WriteFailed,
 }
 
-fn patch() -> Result<(), PatchError> {
-    let key = CURRENT_USER.open(r#"Software\Classes\ResolveBinFile\shell\open\command"#).map_err(|e| {
-        log::error!("read registry key error: {e:#?}");
-        PatchError::ResolveNotFound
-    })?.get_string("").map_err(|e| {
-        log::error!("read registry value error: {e:#?}");
-        PatchError::ResolveNotFound
-    })?;
-
-    let (key, _) = key.rsplit_once(' ').ok_or(PatchError::ResolveNotFound)?;
-
-    let resolve_path = &key[1..key.len()-1];
-
-    let Ok(mut data) = std::fs::read(resolve_path) else {
-        Err(PatchError::ResolveNotFound)?
-    };
-
-    let mut patches = false;
-
-    for (sig, replacement) in PATCHES {
-        let searcher = coolfindpattern::PatternSearcher::new(&data, sig);
-
-        let occs: Vec<usize> = searcher.collect();
-
-        match occs.len() {
-            0 => {}
-            1 => {
-                let addr = occs[0];
-
-                data[addr..addr + replacement.len()].copy_from_slice(replacement);
-
-                patches = true;
-            }
-            _ => {
-                Err(PatchError::SignatureOccurrenceMismatch(occs.len()))?
+fn extract_path(cmd: &str) -> Option<String> {
+    if let Some(start) = cmd.find('"') {
+        if let Some(end) = cmd[start + 1..].find('"') {
+            let path = &cmd[start + 1..start + 1 + end];
+            if path.to_lowercase().contains("resolve") {
+                return Some(path.to_string());
             }
         }
     }
+    
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    for word in words {
+        if word.to_lowercase().contains("resolve") && word.contains(':') {
+            return Some(word.to_string());
+        }
+    }
+    None
+}
 
-    if !patches {
-        Err(PatchError::NoSignatureFound)?
+fn check_associations() -> Option<String> {
+    let exts = [".drp", ".drt", ".drb", ".drfx", ".braw"];
+    for ext in &exts {
+        if let Ok(key) = LOCAL_MACHINE.open(&format!("SOFTWARE\\Classes\\{}", ext)) {
+            if let Ok(file_type) = key.get_string("") {
+                let command_path = format!("SOFTWARE\\Classes\\{}\\shell\\open\\command", file_type);
+                if let Ok(command_key) = LOCAL_MACHINE.open(&command_path) {
+                    if let Ok(command) = command_key.get_string("") {
+                        if let Some(path) = extract_path(&command) {
+                            if Path::new(&path).exists() {
+                                return Some(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn check_uninstall() -> Option<String> {
+    if let Ok(uninstall_key) = LOCAL_MACHINE.open("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall") {
+        for i in 0..10000 {
+            let key_name = format!("{:08X}-0000-0000-0000-000000000000", i);
+            let guid_key = format!("{{{}}}", key_name);
+            
+            if let Ok(subkey) = uninstall_key.open(&guid_key) {
+                if let Ok(display_name) = subkey.get_string("DisplayName") {
+                    if display_name.to_lowercase().contains("resolve") {
+                        if let Some(path) = try_extract_resolve_path(&subkey) {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+            
+            if let Ok(subkey) = uninstall_key.open(&key_name) {
+                if let Ok(display_name) = subkey.get_string("DisplayName") {
+                    if display_name.to_lowercase().contains("resolve") {
+                        if let Some(path) = try_extract_resolve_path(&subkey) {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn try_extract_resolve_path(subkey: &windows_registry::Key) -> Option<String> {
+    let keys_to_try = ["InstallLocation", "InstallDir", "UninstallString", "DisplayIcon"];
+    
+    for key_name in &keys_to_try {
+        if let Ok(value) = subkey.get_string(key_name) {
+            let directory = match *key_name {
+                "UninstallString" => {
+                    if let Some(start) = value.find('"') {
+                        if let Some(end) = value[start + 1..].find('"') {
+                            let exe_path = &value[start + 1..start + 1 + end];
+                            Path::new(exe_path).parent()?.to_string_lossy().to_string()
+                        } else { 
+                            continue; 
+                        }
+                    } else { 
+                        continue; 
+                    }
+                }
+                "DisplayIcon" => {
+                    Path::new(&value).parent()?.to_string_lossy().to_string()
+                }
+                _ => value
+            };
+            
+            let resolve_exe = format!("{}\\Resolve.exe", directory);
+            if Path::new(&resolve_exe).exists() {
+                return Some(resolve_exe);
+            }
+        }
+    }
+    None
+}
+
+fn locate() -> Result<String, PatchError> {
+    if let Ok(key) = CURRENT_USER.open(r#"Software\Classes\ResolveBinFile\shell\open\command"#) {
+        if let Ok(command) = key.get_string("") {
+            if let Some(space_pos) = command.rfind(' ') {
+                let part = &command[..space_pos];
+                if let Some(colon_pos) = part.rfind(':') {
+                    let path = &part[colon_pos + 1..];
+                    if Path::new(path).exists() {
+                        return Ok(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    warn!("Registry key removed in newer versions, trying alternatives");
+    
+    if let Some(path) = check_associations() { 
+        return Ok(path); 
+    }
+    
+    if let Some(path) = check_uninstall() { 
+        return Ok(path); 
+    }
+    
+    Err(PatchError::ResolveNotFound)
+}
+
+fn patch() -> Result<(), PatchError> {
+    let path = locate()?;
+    info!("Found Resolve at: {}", path);
+    
+    let data = fs::read(&path).map_err(|_| PatchError::ResolveNotFound)?;
+    let mut patched = data.clone();
+    let mut applied = false;
+
+    for (sig, replacement) in PATCHES {
+        let searcher = coolfindpattern::PatternSearcher::new(&data, sig);
+        let found: Vec<usize> = searcher.collect();
+        
+        match found.len() {
+            1 => {
+                let addr = found[0];
+                let end = addr + replacement.len();
+                if end > patched.len() {
+                    return Err(PatchError::NoSignatureFound);
+                }
+                patched[addr..end].copy_from_slice(replacement);
+                applied = true;
+                info!("Applied patch at offset: 0x{:X}", addr);
+            }
+            0 => continue,
+            _ => return Err(PatchError::SignatureOccurrenceMismatch(found.len())),
+        }
     }
 
-    let Ok(_) = std::fs::copy(
-        resolve_path,
-        &format!("{resolve_path}.bak"),
-    ) else {
-        Err(PatchError::BackupFailed)?
-    };
+    if !applied {
+        return Err(PatchError::NoSignatureFound);
+    }
 
-    let Ok(_) = std::fs::write(resolve_path, data) else {
-        Err(PatchError::WriteFailed)?
-    };
+    fs::copy(&path, format!("{}.bak", path)).map_err(|_| PatchError::BackupFailed)?;
+    fs::write(&path, &patched).map_err(|_| PatchError::WriteFailed)?;
 
     Ok(())
 }
 
 fn main() {
-    let _ = simplelog::SimpleLogger::init(log::LevelFilter::Info, Config::default());
-
-    log::info!("attempting to patch resolve!");
-
+    let _ = SimpleLogger::init(log::LevelFilter::Info, Config::default());
+    info!("starting patch process");
     match patch() {
-        Ok(_) => {
-            log::info!("successfully patched!");
-        }
-        Err(e) => {
-            log::error!("failed to patch resolve: {e}")
-        }
+        Ok(_) => info!("patch applied successfully"),
+        Err(e) => error!("patch failed: {}", e),
     }
-
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(3));
 }
