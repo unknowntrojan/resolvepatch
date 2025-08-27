@@ -7,7 +7,7 @@ edition = "2021"
 opt-level = "s"
 
 [dependencies]
-coolfindpattern = { version = "0.1" }
+coolfindpattern = { path = "local-coolfindpattern" } 
 log = "0.4"
 simplelog = "0.12"
 thiserror = "2"
