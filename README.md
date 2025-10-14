@@ -2,7 +2,8 @@
 
 Patch Davinci Resolve Studio 18.x-20.x to think it's activated
 
-**Some users are experiencing a rendering bug in versions >18.6.2. This is possibly an antipiracy measure. Resolve is incredibly annoying to analyze due to its size, and I am currently very busy, but I am planning to check this out further once I have the time. Either use 18.6.2 or render the output with padding to the top, then cut the padding back off with ffmpeg.**
+~~**Some users are experiencing a rendering bug in versions >18.6.2. This is possibly an antipiracy measure. Resolve is incredibly annoying to analyze due to its size, and I am currently very busy, but I am planning to check this out further once I have the time. Either use 18.6.2 or render the output with padding to the top, then cut the padding back off with ffmpeg.**~~
+**I have released a patch to fix the patcher for 20.x versions. Please update to 20.x versions of Resolve and use the newest version of the patcher.**
 
 ## Instructions
 
