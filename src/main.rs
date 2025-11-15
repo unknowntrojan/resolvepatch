@@ -136,7 +136,6 @@ const LIC_FILE: &'static str = r#"LICENSE blackmagic davinciresolvestudio 999999
 fn configure_license_file(path: &str) -> Result<(), PatchError> {
     let mut path = PathBuf::from_str(path).map_err(|_| PatchError::LicenseFileError)?;
 
-    path.pop();
     path.set_file_name("blackmagic.lic");
 
     std::fs::write(&path, LIC_FILE).map_err(|_| PatchError::LicenseFileError)?;
