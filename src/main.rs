@@ -1,4 +1,4 @@
-use std::{
+ use std::{
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -8,6 +8,62 @@ use pelite::pe::Pe;
 use simplelog::Config;
 use windows_registry::{CURRENT_USER, LOCAL_MACHINE};
 
+// ========================================================================
+// v21 DIALOG BYPASS — the missing piece!
+// ========================================================================
+// In Resolve 21, Blackmagic added a new license-check chain function that
+// shows the "License Key / Blackmagic Cloud ID" chooser dialog at startup.
+// This function was discovered via Frida dynamic analysis. The original
+// unknowntrojan Rust patcher doesn't know about it (designed for v20).
+//
+// The fix: find the function prologue + first JNE, and convert that JNE
+// to an unconditional JMP so the function always takes the early-exit
+// success path, never reaching the dialog construction code.
+fn patch_v21_dialog(data: &mut [u8]) -> Result<(), PatchError> {
+    // This is the "Beta 3" pattern from resolvepatch_v2.py which successfully
+    // bypassed the license dialog in the current v21.0.0 build.
+    // It has two extra bytes (33 C9 = xor ecx,ecx) compared to the original v21 pattern,
+    // which shifts the JNE (0F 85) to offset 24 instead of 22.
+    let searcher = coolfindpattern::PatternSearcher::new(
+        &data,
+        pattern!(
+            0x48, 0x89, 0x5C, 0x24, 0x10, 0x57,
+            0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00,
+            0x33, 0xDB, 0x33, 0xC9,
+            0xE8, _, _, _, _,
+            0x84, 0xC0,
+            0x0F, 0x85, _, _, _, _
+        ),
+    );
+
+    let occs: Vec<usize> = searcher.collect();
+
+    match occs.len() {
+        0 => {
+            log::warn!("v21 dialog bypass: pattern not found (may already be patched)");
+            return Ok(());
+        }
+        1 => {
+            let addr = occs[0];
+            // Replace bytes 24-25 (0F 85 = JNE) with (90 E9 = NOP + JMP)
+            // Bytes 26-29 (the rel32 displacement) are left intact,
+            // so the JMP lands exactly where the JNE would have.
+            log::info!("v21 dialog bypass: patching at offset 0x{:08X}", addr);
+            data[addr + 24] = 0x90; // NOP
+            data[addr + 25] = 0xE9; // JMP rel32
+            // bytes 26..30 stay as-is (original displacement)
+            Ok(())
+        }
+        n => {
+            log::warn!("v21 dialog bypass: pattern matched {} times — skipping", n);
+            Err(PatchError::SignatureOccurrenceMismatch(n))
+        }
+    }
+}
+
+// ========================================================================
+// patch_4func — Dolby Vision license validator
+// ========================================================================
 fn patch_4func(data: &mut [u8]) -> Result<(), PatchError> {
     let addr = {
         let searcher = coolfindpattern::PatternSearcher::new(
@@ -41,11 +97,16 @@ fn patch_4func(data: &mut [u8]) -> Result<(), PatchError> {
         addr
     };
 
+    // v21 FIX: In Resolve 21, Blackmagic added 3 extra Dolby Vision license
+    // checks for inner1. Indices [0,1,2,3] all jump to the same fail-block.
+    // Indices [4,5] are normal program logic — DO NOT touch.
+    // Inner2 stays the same as v20: indices [0,1,2] are license checks,
+    // index [3] has different context (0x48 prefix = different instruction).
     const LOCAL_PATCHES: &'static [(&'static [Option<u8>], &'static [u8], &'static [usize])] = &[
         (
             pattern!(0x84, 0xC0, 0x0F, 0x84),
             &[0x84, 0xC0, 0x0F, 0x85],
-            &[0],
+            &[0, 1, 2, 3],
         ),
         (
             pattern!(0x85, 0xDB, 0x0F, 0x84),
@@ -71,6 +132,10 @@ fn patch_4func(data: &mut [u8]) -> Result<(), PatchError> {
     Ok(())
 }
 
+// ========================================================================
+// Patch tables (from unknowntrojan — render guards & timer mines)
+// ========================================================================
+
 const PATCHES_OLD: &'static [(&'static [Option<u8>], &'static [u8])] = &[
     (
         pattern!(
@@ -89,7 +154,6 @@ const PATCHES_OLD: &'static [(&'static [Option<u8>], &'static [u8])] = &[
 ];
 
 const PATCHES_20: &'static [(&'static [Option<u8>], &'static [u8])] = &[
-    // for 20.x only
     (
         pattern!(
             0x74, _, 0x48, 0x8B, 0x44, 0x24, _, 0x8B, 0x4C, 0x24, _, 0x89, 0x48, _, 0x33, 0xC0,
@@ -105,10 +169,12 @@ const PATCHES_20: &'static [(&'static [Option<u8>], &'static [u8])] = &[
         &[0xEB],
     ),
     (
+        // v21 FIX: Use NOP + JMP preserving original rel32 offset instead
+        // of hardcoded 0xA4.
         pattern!(
             0x0F, 0x84, _, _, _, _, 0xFF, 0x15, _, _, _, _, 0x83, 0xF8, 0x02, 0x75
         ),
-        &[0xE9, 0xA4, 0x00, 0x00, 0x00, 0x90],
+        &[0x90, 0xE9],
     ),
     (
         pattern!(
@@ -127,8 +193,6 @@ const PATCHES_20: &'static [(&'static [Option<u8>], &'static [u8])] = &[
 ];
 
 /// `RLM_LICENSE=blackmagic.lic`
-///
-/// contents: this
 const LIC_FILE: &'static str = r#"LICENSE blackmagic davinciresolvestudio 999999 permanent uncounted
   hostid=ANY issuer=ANY customer=ANY issued=14-Aug-2025
   akey=0000-0000-0000-0000-0000 _ck=00 sig="00""#;
@@ -197,12 +261,21 @@ fn patch(resolve_path: &str) -> Result<(), PatchError> {
     };
 
     let version = determine_version(&data)?;
+    log::info!("detected version: {}.{}.{}", version.0, version.1, version.2);
 
+    // STEP 1: v21 dialog bypass (new — not in original unknowntrojan code)
+    if version.0 >= 21 {
+        log::info!("applying v21 dialog bypass...");
+        match patch_v21_dialog(&mut data) {
+            Ok(_) => log::info!("v21 dialog bypass: OK"),
+            Err(e) => log::warn!("v21 dialog bypass failed: {e} (continuing)"),
+        }
+    }
+
+    // STEP 2: render guard patches (unknowntrojan's 5 signatures)
     let patches = match version.0 {
         0..18 => {
-            log::warn!(
-                "This version of Resolve is too old and therefore unsupported. We will attempt to patch anyway, but it may well fail. Recommended versions: 18.6.2, 20.x"
-            );
+            log::warn!("version too old, attempting PATCHES_OLD");
             PATCHES_OLD
         }
         18 | 19 => {
@@ -213,39 +286,48 @@ fn patch(resolve_path: &str) -> Result<(), PatchError> {
         }
         20 => PATCHES_20,
         21..=u16::MAX => {
-            log::warn!(
-                "This version of Resolve is too new and therefore unsupported. We will attempt to patch anyway, but it may fail. Recommended versions: 18.6.2, 20.x"
-            );
+            log::info!("v21+: applying PATCHES_20 render guards");
             PATCHES_20
         }
     };
 
     let mut patched = false;
 
-    for (sig, replacement) in patches {
+    for (i, (sig, replacement)) in patches.iter().enumerate() {
         let searcher = coolfindpattern::PatternSearcher::new(&data, sig);
 
         let occs: Vec<usize> = searcher.collect();
 
         match occs.len() {
-            0 => {}
+            0 => {
+                log::info!("patch[{}]: no match (may already be patched)", i);
+            }
             1 => {
                 let addr = occs[0];
-
+                log::info!("patch[{}]: applying at offset 0x{:08X}", i, addr);
                 data[addr..addr + replacement.len()].copy_from_slice(replacement);
-
                 patched = true;
             }
-            _ => Err(PatchError::SignatureOccurrenceMismatch(occs.len()))?,
+            n => {
+                log::warn!("patch[{}]: matched {} times — skipping", i, n);
+            }
+        }
+    }
+
+    // STEP 3: Dolby Vision fix (patch_4func)
+    if version.0 >= 20 {
+        log::info!("applying patch_4func (Dolby Vision)...");
+        match patch_4func(&mut data) {
+            Ok(_) => {
+                log::info!("patch_4func: OK");
+                patched = true;
+            }
+            Err(e) => log::warn!("patch_4func: {} (continuing)", e),
         }
     }
 
     if !patched {
         Err(PatchError::NoSignatureFound)?
-    }
-
-    if version.0 >= 20 {
-        patch_4func(&mut data)?;
     }
 
     let Ok(_) = std::fs::copy(resolve_path, &format!("{resolve_path}.bak")) else {
@@ -270,6 +352,8 @@ fn main() {
         log::error!("unable to find resolve....");
         return;
     };
+
+    log::info!("target: {}", path);
 
     match patch(&path) {
         Ok(_) => {
